@@ -2,11 +2,21 @@ import glob
 import os
 import shutil
 import subprocess
+import random
 import numpy as np
 import torch
 
 # Flow & TraCI imports
-from flow.core.params import VehicleParams, NetParams, SumoParams, EnvParams, InitialConfig, TrafficLightParams
+from flow.core.params import (
+    VehicleParams,
+    NetParams,
+    SumoParams,
+    EnvParams,
+    InitialConfig,
+    TrafficLightParams,
+    InFlows,
+    SumoCarFollowingParams,
+)
 from flow.envs import TestEnv
 
 # Custom Project Modules
@@ -16,9 +26,9 @@ from multitask_dqn_model import MultiTaskDQN
 
 # File and Directory Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# TARGET_CKPT_DIR = os.path.join(SCRIPT_DIR, "checkpoints", "---")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "scenario_i_frames")
-VIDEO_NAME = os.path.join(SCRIPT_DIR, "scenario_i_demo.mp4")
+TARGET_CKPT_DIR = os.path.join(SCRIPT_DIR, "checkpoints", "dqn_run_20260824_134534")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "scenario_g_left_frames")
+VIDEO_NAME = os.path.join(SCRIPT_DIR, "scenario_g_left_demo.mp4")
 
 
 def resolve_checkpoint(run_dir):
@@ -46,8 +56,8 @@ def resolve_checkpoint(run_dir):
     return found[0]
 
 
-def record_scenario_i_demo():
-    TASK_CHOICE = "straight"
+def record_scenario_g_demo():
+    TASK_CHOICE = "left"
     VIEW_ID = "View #0"
     FPS = 10
 
@@ -76,39 +86,100 @@ def record_scenario_i_demo():
         policy.load_state_dict(checkpoint_data)
     policy.eval()
 
-    # 2. Build Scenario i Geometry & Flow Environment
-    scenario_i_cfg = SCENARIO_CONFIGS["scenario_i"]
+    # 2. Build Scenario g Geometry & Continuous Dynamic InFlows
+    scenario_g_cfg = SCENARIO_CONFIGS["scenario_g"]
 
+    run_seed = random.randint(1, 99999)
     sim_params = SumoParams(
         sim_step=0.1,
         render=True,
-        restart_instance=True
+        restart_instance=True,
+        seed=run_seed
     )
 
-    # Define vehicle types:
-    # color="green" ensures SUMO spawns the rl vehicle as green from frame 0
+    # Aggressive control parameters for the RL ego agent:
+    # speed_mode="aggressive" (or speed_mode=1) disables internal junction yielding and checks
+    rl_car_following = SumoCarFollowingParams(
+        accel=2.6,
+        decel=4.5,
+        min_gap=1.5,
+        max_speed=18.0,
+        speed_mode="aggressive"
+    )
+
+    # Background human driver behavior
+    congested_car_following = SumoCarFollowingParams(
+        accel=2.8,
+        decel=4.5,
+        sigma=0.5,
+        speed_dev=0.2,
+        min_gap=1.5,
+        max_speed=18.0,
+        speed_mode=1
+    )
+
     vehicles = VehicleParams()
     vehicles.add(
         veh_id="rl",
         num_vehicles=0,
-        color="green"
+        color="green",
+        car_following_params=rl_car_following
     )
     vehicles.add(
         veh_id="human",
-        num_vehicles=25,
-        color="white"
+        num_vehicles=0,
+        color="white",
+        car_following_params=congested_car_following
     )
 
-    net_params = NetParams(additional_params=scenario_i_cfg)
-    valid_spawn_edges = ["north_in", "south_in", "east_in", "west_in"]
+    inflows = InFlows()
+
+    # Heavy oncoming stream from West (primary crossing conflict for left-turn)
+    inflows.add(
+        veh_type="human",
+        edge="west_in",
+        vehs_per_hour=1400,
+        depart_lane="random",
+        depart_speed=10.0
+    )
+
+    # Cross-traffic from North
+    inflows.add(
+        veh_type="human",
+        edge="north_in",
+        vehs_per_hour=1100,
+        depart_lane="random",
+        depart_speed=10.0
+    )
+
+    # Cross-traffic from South
+    inflows.add(
+        veh_type="human",
+        edge="south_in",
+        vehs_per_hour=900,
+        depart_lane="random",
+        depart_speed=10.0
+    )
+
+    # Controlled inflow on East
+    inflows.add(
+        veh_type="human",
+        edge="east_in",
+        vehs_per_hour=200,
+        depart_lane="random",
+        depart_speed=10.0
+    )
+
+    net_params = NetParams(
+        inflows=inflows,
+        additional_params=scenario_g_cfg
+    )
 
     flow_network = UnsignalizedIntersectionNetwork(
-        name="scenario_i_network",
+        name="scenario_g_network",
         vehicles=vehicles,
         net_params=net_params,
-        initial_config=InitialConfig(
-            edges_distribution=valid_spawn_edges
-        ),
+        initial_config=InitialConfig(),
         traffic_lights=TrafficLightParams()
     )
 
@@ -121,13 +192,18 @@ def record_scenario_i_demo():
     env = MultiTaskIntersectionEnv(base_flow_env)
 
     # 3. Reset Environment & Initialize Visuals
-    print(f"[+] Initializing Scenario i (Task: '{TASK_CHOICE}')...")
+    print(f"[+] Initializing Scenario g (Task: '{TASK_CHOICE}', Seed: {run_seed})...")
     obs, info = env.reset(options={"task": TASK_CHOICE})
 
     traci_api = env.flow_env.k.kernel_api
     ego_id = env._current_ego_id
 
-    # Center camera on the ego car immediately
+    # Enforce aggressive speed mode directly on the ego vehicle instance via TraCI
+    # 0 = completely unregulated, 1 = no yield/emergency braking (standard aggressive)
+    if ego_id in traci_api.vehicle.getIDList():
+        traci_api.vehicle.setSpeedMode(ego_id, 1)
+
+    # Center camera on the ego car
     traci_api.gui.setZoom(VIEW_ID, 450)
     if ego_id in traci_api.vehicle.getIDList():
         traci_api.gui.trackVehicle(VIEW_ID, ego_id)
@@ -135,6 +211,14 @@ def record_scenario_i_demo():
     step = 0
     done = False
     task_g_tensor = torch.tensor(env.active_g, dtype=torch.float32, device=device).unsqueeze(0)
+
+    # Allow vehicles to populate the conflict lanes before frame capture starts
+    WARMUP_STEPS = 45
+    print(f"[+] Running {WARMUP_STEPS} warm-up steps to flood Scenario g intersection...")
+    for _ in range(WARMUP_STEPS):
+        obs, _, terminated, truncated, _ = env.step(0)
+        if terminated or truncated:
+            break
 
     print("[+] Recording simulation frames...")
     try:
@@ -179,4 +263,4 @@ def record_scenario_i_demo():
 
 
 if __name__ == "__main__":
-    record_scenario_i_demo()
+    record_scenario_g_demo()
